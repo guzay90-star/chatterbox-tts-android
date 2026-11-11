@@ -79,3 +79,4 @@ English, French, German, Spanish, Portuguese, Italian, Dutch, Polish, Czech, Rom
 ## License
 
 Apache 2.0
+Build Android APK.
