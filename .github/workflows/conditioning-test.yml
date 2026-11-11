@@ -1,0 +1,92 @@
+name: Conditioning smoke test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/conditioning-test.yml'
+permissions:
+  contents: read
+jobs:
+  conditioning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Prepare real model test
+        shell: bash
+        run: |
+          chmod +x gradlew
+          mkdir -p app/src/androidTest/assets app/src/androidTest/java/com/acul3/chatterboxtts
+          for model in t3_cond_speech_emb t3_cond_enc; do
+            curl --fail --location --retry 3 "https://huggingface.co/acul3/chatterbox-executorch/resolve/e444904352a22332a8083d6fb7b9354ee5e96daf/$model.pte" -o "app/src/androidTest/assets/$model.pte"
+          done
+          cat > app/src/androidTest/java/com/acul3/chatterboxtts/ConditioningTest.kt <<'KOTLIN'
+          package com.acul3.chatterboxtts
+          import androidx.test.ext.junit.runners.AndroidJUnit4
+          import androidx.test.platform.app.InstrumentationRegistry
+          import org.junit.Test
+          import org.junit.runner.RunWith
+          import org.junit.Assert.*
+          import org.pytorch.executorch.Module
+          import org.pytorch.executorch.Tensor
+          import org.pytorch.executorch.EValue
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          @RunWith(AndroidJUnit4::class)
+          class ConditioningTest {
+              @Test fun defaultVoiceConditioningExecutes() {
+                  val instrumentation = InstrumentationRegistry.getInstrumentation()
+                  val app = instrumentation.targetContext
+                  fun model(name: String): Module {
+                      val file = File(app.cacheDir, name)
+                      instrumentation.context.assets.open(name).use { input -> file.outputStream().use { input.copyTo(it) } }
+                      return Module.load(file.absolutePath)
+                  }
+                  fun floats(name: String, shape: LongArray): Tensor {
+                      val bytes = app.assets.open(name).use { it.readBytes() }
+                      val data = FloatArray(bytes.size / 4)
+                      ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(data)
+                      return Tensor.fromBlob(data, shape)
+                  }
+                  val bytes = app.assets.open("cond_speech_tokens.bin").use { it.readBytes() }
+                  val tokens = IntArray(bytes.size / 4)
+                  ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(tokens)
+                  val speech = model("t3_cond_speech_emb.pte").forward(EValue.from(Tensor.fromBlob(tokens, longArrayOf(1, 150))))[0].toTensor()
+                  val result = model("t3_cond_enc.pte").forward(
+                      EValue.from(floats("speaker_emb.bin", longArrayOf(1, 256))),
+                      EValue.from(speech),
+                      EValue.from(floats("emotion_adv.bin", longArrayOf(1, 1, 1)))
+                  )[0].toTensor()
+                  android.util.Log.i("ConditioningTest", "Output shape: " + result.shape().contentToString())
+                  assertTrue(result.dataAsFloatArray.isNotEmpty())
+                  assertTrue(result.dataAsFloatArray.all { it.isFinite() })
+              }
+          }
+          KOTLIN
+      - name: Enable KVM for emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Execute conditioning on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          script: ./gradlew connectedDebugAndroidTest --stacktrace
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conditioning-test-results
+          path: |
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
