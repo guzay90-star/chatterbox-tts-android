@@ -29,6 +29,10 @@ class ChatterboxTTS(private val context: Context) {
         private const val TAG = "ChatterboxTTS"
     }
 
+    // VOICE_V2_PATCH — voice pack and expression are applied before each generation.
+    private val voicePackManager = VoicePackManager(context)
+    private var activePackId = VoicePackManager.DEFAULT_ID
+    private var activeExpression = 0.5f
     private val modelManager = ModelManager(context)
     private var tokenizer: TextTokenizer? = null
 
@@ -105,9 +109,17 @@ class ChatterboxTTS(private val context: Context) {
     fun generate(
         text: String,
         language: String,
+        voicePackId: String = VoicePackManager.DEFAULT_ID,
+        expression: Float = 0.5f,
+        speed: Float = 1f,
+        pitchSemitones: Float = 0f,
+        warmth: Float = 0f,
+        texture: Float = 0f,
         onProgress: (Float, String) -> Unit
     ): ByteArray {
         val tok = tokenizer ?: throw IllegalStateException("Tokenizer not loaded")
+        prepareVoice(voicePackId, expression)
+        vocoderPipeline?.selectVoice(voicePackId)
         val condEmb = cachedCondEmb ?: throw IllegalStateException("Conditioning not computed")
 
         // Step 1: Tokenize text
@@ -147,8 +159,9 @@ class ChatterboxTTS(private val context: Context) {
 
         // Step 4: Convert to WAV
         onProgress(0.95f, "Encoding WAV...")
-        val wavData = AudioPlayer.floatToWav(audioSamples, Constants.S3GEN_SR)
-        val durationSec = audioSamples.size.toFloat() / Constants.S3GEN_SR
+        val adjustedSamples = VoiceEffects.process(audioSamples, speed, pitchSemitones, warmth, texture)
+        val wavData = AudioPlayer.floatToWav(adjustedSamples, Constants.S3GEN_SR)
+        val durationSec = adjustedSamples.size.toFloat() / Constants.S3GEN_SR
 
         onProgress(1f, "Done! ${String.format("%.1f", durationSec)}s of audio generated.")
         Log.i(TAG, "Generated ${wavData.size} bytes WAV (${durationSec}s)")
@@ -204,6 +217,35 @@ class ChatterboxTTS(private val context: Context) {
             condEncModel?.close()
         }
         Log.i(TAG, "cond_emb shape: ${cachedCondEmb!!.shape().contentToString()}")
+    }
+
+    /** Switches neural conditioning only when actual speaker or expression changes. */
+    private fun prepareVoice(packId: String, expression: Float) {
+        val adjustedExpression = expression.coerceIn(0.25f, 1.5f)
+        if (cachedCondEmb != null && activePackId == packId && activeExpression == adjustedExpression) return
+        val speakerBytes = voicePackManager.readAsset(packId, "speaker_emb.bin")
+        val tokenBytes = voicePackManager.readAsset(packId, "cond_speech_tokens.bin")
+        speakerEmb = tensorFromFloatBytes(speakerBytes, longArrayOf(1, 256))
+        condSpeechTokens = tensorFromIntBytes(tokenBytes, longArrayOf(1, 150))
+        emotionAdv = Tensor.fromBlob(floatArrayOf(adjustedExpression), longArrayOf(1, 1, 1))
+        cachedCondEmb = null
+        precomputeCondEmb()
+        activePackId = packId
+        activeExpression = adjustedExpression
+    }
+
+    private fun tensorFromFloatBytes(bytes: ByteArray, shape: LongArray): Tensor {
+        val fb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val data = FloatArray(fb.remaining())
+        fb.get(data)
+        return Tensor.fromBlob(data, shape)
+    }
+
+    private fun tensorFromIntBytes(bytes: ByteArray, shape: LongArray): Tensor {
+        val ib = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+        val data = IntArray(ib.remaining())
+        ib.get(data)
+        return Tensor.fromBlob(data, shape)
     }
 
     // ── Asset loading helpers ─────────────────────────────────────────────────

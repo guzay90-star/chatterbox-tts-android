@@ -3,6 +3,7 @@ package com.acul3.chatterboxtts.models
 import android.content.Context
 import android.util.Log
 import com.acul3.chatterboxtts.tts.Constants
+import com.acul3.chatterboxtts.tts.VoicePackManager
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Tensor
 import java.nio.ByteBuffer
@@ -50,11 +51,27 @@ class VocoderPipeline(
         private const val CFM_STEPS = 2            // meanflow distilled: 2 steps
     }
 
-    // Prompt conditioning loaded once from assets
-    private val promptTokens: Tensor by lazy { loadIntAsset("prompt_tokens.bin", longArrayOf(1, 75)) }
-    private val promptTokenLen: Tensor by lazy { loadIntAsset("prompt_token_len.bin", longArrayOf(1)) }
-    private val xVector: Tensor by lazy { loadFloatAsset("xvector.bin", longArrayOf(1, 192)) }
-    private val promptMel: Tensor by lazy { loadFloatAsset("prompt_mel.bin", longArrayOf(1, 314, 80)) }
+    // VOICE_V2_PATCH: replace small voice tensors without reloading any large PTE model.
+    private val packStore = VoicePackManager(context)
+    private var activePack: String? = null
+    private lateinit var promptTokens: Tensor
+    private lateinit var promptTokenLen: Tensor
+    private lateinit var xVector: Tensor
+    private lateinit var promptMel: Tensor
+
+    fun selectVoice(packId: String) {
+        if (activePack == packId) return
+        // Validate and load everything before changing the active pack.
+        val tokens = loadIntAsset("prompt_tokens.bin", longArrayOf(1, 75), packId)
+        val tokenLen = loadIntAsset("prompt_token_len.bin", longArrayOf(1), packId)
+        val xVec = loadFloatAsset("xvector.bin", longArrayOf(1, 192), packId)
+        val mel = loadFloatAsset("prompt_mel.bin", longArrayOf(1, 314, 80), packId)
+        promptTokens = tokens
+        promptTokenLen = tokenLen
+        xVector = xVec
+        promptMel = mel
+        activePack = packId
+    }
 
     /**
      * Convert speech tokens to audio samples.
@@ -68,6 +85,7 @@ class VocoderPipeline(
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): FloatArray {
         try {
+        check(activePack != null) { "Voice profile must be selected before synthesis" }
         Log.i(TAG, "Starting vocoder pipeline with ${speechTokens.size} speech tokens")
 
         val nTokens = speechTokens.size
@@ -336,16 +354,16 @@ class VocoderPipeline(
         return out
     }
 
-    private fun loadFloatAsset(name: String, shape: LongArray): Tensor {
-        val bytes = context.assets.open(name).readBytes()
+    private fun loadFloatAsset(name: String, shape: LongArray, packId: String): Tensor {
+        val bytes = packStore.readAsset(packId, name)
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         val floats = FloatArray(bytes.size / 4)
         buffer.asFloatBuffer().get(floats)
         return Tensor.fromBlob(floats, shape)
     }
 
-    private fun loadIntAsset(name: String, shape: LongArray): Tensor {
-        val bytes = context.assets.open(name).readBytes()
+    private fun loadIntAsset(name: String, shape: LongArray, packId: String): Tensor {
+        val bytes = packStore.readAsset(packId, name)
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         val ints = IntArray(bytes.size / 4)
         buffer.asIntBuffer().get(ints)

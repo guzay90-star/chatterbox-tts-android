@@ -1,6 +1,11 @@
 package com.acul3.chatterboxtts.ui
 
 import android.content.Context
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import com.acul3.chatterboxtts.tts.VoiceStyles
+import com.acul3.chatterboxtts.tts.VoicePack
+import com.acul3.chatterboxtts.tts.VoiceStyle
 import android.media.MediaScannerConnection
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
@@ -27,6 +32,21 @@ fun MainScreen(viewModel: TTSViewModel = viewModel()) {
     val context = LocalContext.current
     val state by viewModel.state.collectAsState()
     val scope = rememberCoroutineScope()
+    // VOICE_V2_PATCH — import real speaker conditioning as a ZIP voice pack.
+    val voiceImport = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) viewModel.importVoicePack(context, uri)
+    }
+    val wavExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
+        if (uri != null) {
+            try {
+                viewModel.saveWavToUri(context, uri)
+                Toast.makeText(context, "WAV сохранён", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка сохранения: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+    LaunchedEffect(Unit) { viewModel.refreshVoicePacks(context) }
 
     Scaffold(
         topBar = {
@@ -67,6 +87,53 @@ fun MainScreen(viewModel: TTSViewModel = viewModel()) {
                 onLanguageSelected = { viewModel.updateLanguage(it) },
                 enabled = !state.isGenerating
             )
+
+            // Speaker selection uses neural conditioning from voice packs.
+            VoicePackDropdown(
+                packs = state.voicePacks,
+                selectedId = state.selectedVoicePack,
+                enabled = !state.isGenerating,
+                onSelect = viewModel::setVoicePack
+            )
+            OutlinedButton(
+                onClick = { voiceImport.launch("application/zip") },
+                enabled = !state.isGenerating,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Импортировать голосовой пакет ZIP") }
+            Text(
+                "ZIP должен содержать параметры подготовленного голоса. Обычный WAV пока нельзя использовать для клонирования.",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            VoiceStyleDropdown(
+                selectedId = state.styleId,
+                enabled = !state.isGenerating,
+                onSelect = viewModel::setStyle
+            )
+            Text("Стили изменяют звучание выбранного голоса, но не создают нового диктора.", style = MaterialTheme.typography.bodySmall)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Скорость: ${"%.2f".format(java.util.Locale.US, state.speed)}×")
+                Slider(
+                    value = state.speed,
+                    onValueChange = viewModel::setSpeed,
+                    valueRange = 0.65f..1.5f,
+                    enabled = !state.isGenerating
+                )
+                Text("Высота: ${"%.1f".format(java.util.Locale.US, state.pitch)} полутона")
+                Slider(
+                    value = state.pitch,
+                    onValueChange = viewModel::setPitch,
+                    valueRange = -7f..7f,
+                    enabled = !state.isGenerating
+                )
+                Text("Выразительность: ${"%.2f".format(java.util.Locale.US, state.expression)}")
+                Slider(
+                    value = state.expression,
+                    onValueChange = viewModel::setExpression,
+                    valueRange = 0.25f..1.5f,
+                    enabled = !state.isGenerating
+                )
+            }
 
             // Generate button
             Button(
@@ -151,9 +218,7 @@ fun MainScreen(viewModel: TTSViewModel = viewModel()) {
 
                     OutlinedButton(
                         onClick = {
-                            scope.launch {
-                                saveWav(context, viewModel)
-                            }
+                            wavExport.launch("chatterbox_${System.currentTimeMillis()}.wav")
                         },
                         modifier = Modifier.weight(1f)
                     ) {
@@ -266,5 +331,58 @@ private fun saveWav(context: Context, viewModel: TTSViewModel) {
         Toast.makeText(context, "Saved to ${file.name}", Toast.LENGTH_SHORT).show()
     } catch (e: Exception) {
         Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VoicePackDropdown(
+    packs: List<VoicePack>, selectedId: String, enabled: Boolean,
+    onSelect: (String) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { if (enabled) expanded = !expanded }) {
+        OutlinedTextField(
+            value = packs.firstOrNull { it.id == selectedId }?.title ?: "Встроенный голос",
+            onValueChange = {},
+            label = { Text("Голос / нейронный профиль") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            readOnly = true,
+            enabled = enabled,
+            modifier = Modifier.fillMaxWidth().menuAnchor()
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            packs.forEach { pack ->
+                DropdownMenuItem(text = { Text(pack.title) }, onClick = { onSelect(pack.id); expanded = false })
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VoiceStyleDropdown(selectedId: String, enabled: Boolean, onSelect: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val style = VoiceStyles.get(selectedId)
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { if (enabled) expanded = !expanded }) {
+        OutlinedTextField(
+            value = style.name,
+            onValueChange = {},
+            label = { Text("Стиль звучания") },
+            supportingText = { Text(style.description) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            readOnly = true,
+            enabled = enabled,
+            modifier = Modifier.fillMaxWidth().menuAnchor()
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            VoiceStyles.all.forEach { item ->
+                DropdownMenuItem(text = { Text("${item.name} — ${item.description}") }, onClick = {
+                    onSelect(item.id)
+                    expanded = false
+                })
+            }
+        }
     }
 }
