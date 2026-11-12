@@ -12,12 +12,12 @@ import org.pytorch.executorch.Tensor
  *
  * Model interfaces (V4):
  *   t3_prefill.pte:
- *     inputs:  cond_emb (1,34,1024) float, text_tokens (1,258) int64
+ *     inputs:  cond_emb (1,34,1024) float, text_tokens (1,258) int32
  *     outputs: logits (1,8194) float, kv_flat (79441920,) float
  *              kv_flat shape = (30, 2, 1, 16, 1293, 64) — split dim1 → keys/values
  *
  *   t3_decode.pte (V4):
- *     inputs:  prev_token (1,1) int64, step_idx () int64 scalar,
+ *     inputs:  prev_token (1,1) int32, step_idx () int32 scalar,
  *              kv_k (30,1,16,1293,64) float, kv_v (30,1,16,1293,64) float
  *     outputs: logits (1,8194) float,
  *              kv_k (30,1,16,1293,64) float, kv_v (30,1,16,1293,64) float
@@ -30,8 +30,7 @@ class T3Decoder(
     companion object {
         private const val TAG = "T3Decoder"
         // KV flat size from prefill: 30 * 2 * 1 * 16 * 1293 * 64 = 79441920
-        // Split: keys = first 30*1*16*1293*64 = 39720960 floats
-        //        values = second 39720960 floats
+        // Each layer stores its key block followed by its value block.
         private const val KV_HALF = 30 * 1 * 16 * 1293 * 64  // 39720960
         private val KV_SHAPE = longArrayOf(30, 1, 16, 1293, 64)
     }
@@ -40,13 +39,14 @@ class T3Decoder(
      * Run the full T3 decode pipeline.
      *
      * @param condEmbedding Conditioning embedding tensor (1, 34, 1024)
-     * @param textTokens Text token IDs (1, 258) int64
+     * @param textTokens Text token IDs (1, 258) int32
      * @param onProgress Callback with (progress 0-1, message)
      * @return Array of speech token IDs
      */
     fun decode(
         condEmbedding: Tensor,
         textTokens: Tensor,
+        maxSteps: Int = Constants.MAX_DECODE_STEPS,
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): LongArray {
         Log.i(TAG, "Starting T3 prefill...")
@@ -61,24 +61,16 @@ class T3Decoder(
         var currentLogits = prefillOutputs[0].toTensor()
         val kvFlat = prefillOutputs[1].toTensor()
 
-        // Split KV flat tensor into keys and values
-        // kvFlat shape: (79441920,) = (30, 2, 1, 16, 1293, 64) interpreted flat
-        // First half = keys (30, 1, 16, 1293, 64), second half = values
-        val kvData = kvFlat.dataAsFloatArray
-        Log.i(TAG, "KV flat size: ${kvData.size}, expected: ${KV_HALF * 2}")
-
-        val kvKData = kvData.copyOfRange(0, KV_HALF)
-        val kvVData = kvData.copyOfRange(KV_HALF, KV_HALF * 2)
-
-        var kvK = Tensor.fromBlob(kvKData, KV_SHAPE)
-        var kvV = Tensor.fromBlob(kvVData, KV_SHAPE)
+        val (initialK, initialV) = splitKvCache(kvFlat)
+        var kvK = initialK
+        var kvV = initialV
 
         Log.i(TAG, "Prefill done, starting decode loop...")
         onProgress(0.05f, "Prefill complete. Decoding speech tokens...")
 
         // Autoregressive decode
         val speechTokens = mutableListOf<Long>()
-        val maxSteps = Constants.MAX_DECODE_STEPS
+        require(maxSteps in 1..Constants.MAX_DECODE_STEPS)
 
         // First token is sampled from prefill logits
         for (step in 0 until maxSteps) {
@@ -110,15 +102,17 @@ class T3Decoder(
                 onProgress(progress, "Decode step $step: ${speechTokens.size} tokens generated")
             }
 
+            if (step + 1 == maxSteps) break
+
             // Prepare decode inputs
-            // prev_token: (1, 1) int64
+            // prev_token: (1, 1) int32
             val tokenTensor = Tensor.fromBlob(
-                longArrayOf(token),
+                intArrayOf(token.toInt()),
                 longArrayOf(1, 1)
             )
-            // step_idx: () int64 scalar (0-indexed, step=0 is first generated token)
+            // step_idx: () int32 scalar (0-indexed, step=0 is first generated token)
             val stepTensor = Tensor.fromBlob(
-                longArrayOf(step.toLong()),
+                intArrayOf(step),
                 longArrayOf()  // scalar = empty shape
             )
 
@@ -140,4 +134,21 @@ class T3Decoder(
 
         return speechTokens.toLongArray()
     }
+    /** The export flattens [layer, key/value, batch, head, time, dim]. */
+    private fun splitKvCache(flat: Tensor): Pair<Tensor, Tensor> {
+        val data = flat.dataAsFloatArray
+        require(data.size == KV_HALF * 2) { "Unexpected KV cache size: ${data.size}" }
+        val layerSize = KV_HALF / Constants.N_LAYERS
+        // Direct buffers avoid two additional 159 MB Java heap arrays.
+        val keys = Tensor.allocateFloatBuffer(KV_HALF)
+        val values = Tensor.allocateFloatBuffer(KV_HALF)
+        for (layer in 0 until Constants.N_LAYERS) {
+            keys.put(data, layer * 2 * layerSize, layerSize)
+            values.put(data, (layer * 2 + 1) * layerSize, layerSize)
+        }
+        keys.rewind()
+        values.rewind()
+        return Tensor.fromBlob(keys, KV_SHAPE) to Tensor.fromBlob(values, KV_SHAPE)
+    }
+
 }
