@@ -1,0 +1,112 @@
+name: Real model pipeline test
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/pipeline-test.yml']
+permissions:
+  contents: read
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Download pinned models
+        run: |
+          mkdir -p ci-models
+          for model in t3_cond_speech_emb t3_cond_enc t3_prefill t3_decode s3gen_encoder cfm_step hifigan; do
+            curl --fail --location --retry 3 "https://huggingface.co/acul3/chatterbox-executorch/resolve/e444904352a22332a8083d6fb7b9354ee5e96daf/$model.pte" -o "ci-models/$model.pte"
+          done
+      - name: Prepare integration test
+        run: |
+          chmod +x gradlew
+          mkdir -p app/src/androidTest/java/com/acul3/chatterboxtts
+          cat > app/src/androidTest/java/com/acul3/chatterboxtts/PipelineTest.kt <<'KOTLIN'
+          package com.acul3.chatterboxtts
+          import androidx.test.ext.junit.runners.AndroidJUnit4
+          import androidx.test.platform.app.InstrumentationRegistry
+          import org.junit.Test
+          import org.junit.runner.RunWith
+          import org.junit.Assert.*
+          import org.pytorch.executorch.Tensor
+          import org.pytorch.executorch.EValue
+          import com.acul3.chatterboxtts.models.PteModel
+          import com.acul3.chatterboxtts.models.T3Decoder
+          import com.acul3.chatterboxtts.models.VocoderPipeline
+          import com.acul3.chatterboxtts.tts.TextTokenizer
+          import com.acul3.chatterboxtts.tts.Constants
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          @RunWith(AndroidJUnit4::class)
+          class PipelineTest {
+              @Test fun russianTextThroughAllSevenModels() {
+                  val app = InstrumentationRegistry.getInstrumentation().targetContext
+                  val modules = mutableListOf<PteModel>()
+                  fun model(name: String): PteModel = PteModel(File(app.getExternalFilesDir(null), "ci-models/$name.pte").absolutePath).also { it.load(); modules.add(it) }
+                  fun floats(name: String, shape: LongArray): Tensor {
+                      val bytes = app.assets.open(name).use { it.readBytes() }
+                      val values = FloatArray(bytes.size / 4)
+                      ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(values)
+                      return Tensor.fromBlob(values, shape)
+                  }
+                  try {
+                      val bytes = app.assets.open("cond_speech_tokens.bin").use { it.readBytes() }
+                      val tokens = IntArray(bytes.size / 4)
+                      ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(tokens)
+                      val speechModel = model("t3_cond_speech_emb")
+                      val condModel = model("t3_cond_enc")
+                      val speech = speechModel.forward(EValue.from(Tensor.fromBlob(tokens, longArrayOf(1,150))))[0].toTensor()
+                      val cond = condModel.forward(EValue.from(floats("speaker_emb.bin",longArrayOf(1,256))), EValue.from(speech), EValue.from(floats("emotion_adv.bin",longArrayOf(1,1,1))))[0].toTensor()
+                      val ownedCond = Tensor.fromBlob(cond.dataAsFloatArray, cond.shape())
+                      speechModel.close(); condModel.close()
+                      val raw = TextTokenizer(app).encode("Привет", "ru").drop(1).dropLast(1)
+                      val text = IntArray(Constants.TEXT_SEQ_LEN)
+                      text[0] = Constants.SOT_TEXT
+                      raw.take(Constants.MAX_TEXT_LEN).forEachIndexed { i, value -> text[i+1] = value }
+                      val decoder = T3Decoder(model("t3_prefill"), model("t3_decode"))
+                      val generated = decoder.decode(ownedCond, Tensor.fromBlob(text,longArrayOf(1,258)), maxSteps=3) { _, msg -> android.util.Log.i("PipelineTest",msg) }
+                      assertTrue("No speech tokens", generated.isNotEmpty())
+                      val vocoder = VocoderPipeline(app, model("s3gen_encoder"), model("cfm_step"), model("hifigan"))
+                      val audio = vocoder.synthesize(generated) { _, msg -> android.util.Log.i("PipelineTest",msg) }
+                      assertTrue("No audio",audio.isNotEmpty())
+                      assertTrue("Non-finite audio",audio.all { it.isFinite() })
+                      android.util.Log.i("PipelineTest", "PASS: all 7 models, ${generated.size} tokens, ${audio.size} finite samples")
+                  } finally { modules.forEach { it.close() } }
+              }
+          }
+          KOTLIN
+          ./gradlew assembleDebug assembleDebugAndroidTest
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run real models on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          ram-size: 8192M
+          heap-size: 1024M
+          disk-size: 10G
+          disable-animations: true
+          script: |
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell mkdir -p /sdcard/Android/data/com.acul3.chatterboxtts/files
+            adb push ci-models /sdcard/Android/data/com.acul3.chatterboxtts/files/
+            ./gradlew connectedDebugAndroidTest --stacktrace
+      - name: Upload APK and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-test-and-apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
