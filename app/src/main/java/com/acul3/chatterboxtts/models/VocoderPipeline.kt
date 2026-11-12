@@ -17,8 +17,8 @@ import kotlin.random.Random
  * Model interfaces:
  *
  *   s3gen_encoder.pte:
- *     inputs:  speech_tokens (1,1000) int64, speech_tok_len (1,) int64,
- *              prompt_tokens (1,75) int64, prompt_tok_len (1,) int64,
+ *     inputs:  speech_tokens (1,1000) int32, speech_tok_len (1,) int32,
+ *              prompt_tokens (1,75) int32, prompt_tok_len (1,) int32,
  *              x_vector (1,192) float32
  *     outputs: h (1,2150,80) float32, h_len (1,) int64,
  *              embedding (1,80) float32, mel_len1 (1,) int64
@@ -51,8 +51,8 @@ class VocoderPipeline(
     }
 
     // Prompt conditioning loaded once from assets
-    private val promptTokens: Tensor by lazy { loadLongAsset("prompt_tokens.bin", longArrayOf(1, 75)) }
-    private val promptTokenLen: Tensor by lazy { loadLongAsset("prompt_token_len.bin", longArrayOf(1)) }
+    private val promptTokens: Tensor by lazy { loadIntAsset("prompt_tokens.bin", longArrayOf(1, 75)) }
+    private val promptTokenLen: Tensor by lazy { loadIntAsset("prompt_token_len.bin", longArrayOf(1)) }
     private val xVector: Tensor by lazy { loadFloatAsset("xvector.bin", longArrayOf(1, 192)) }
     private val promptMel: Tensor by lazy { loadFloatAsset("prompt_mel.bin", longArrayOf(1, 314, 80)) }
 
@@ -75,15 +75,16 @@ class VocoderPipeline(
         onProgress(0f, "Running S3Gen encoder...")
 
         // Pad speech tokens to MAX_SPEECH_TOKENS_VOCODER = 1000
-        val speechToksPadded = LongArray(Constants.MAX_SPEECH_TOKENS_VOCODER) { 0L }
+        val speechToksPadded = IntArray(Constants.MAX_SPEECH_TOKENS_VOCODER)
         val copyLen = min(nTokens, Constants.MAX_SPEECH_TOKENS_VOCODER)
-        speechTokens.copyInto(speechToksPadded, 0, 0, copyLen)
+        require(copyLen > 0) { "No speech tokens generated" }
+        for (i in 0 until copyLen) speechToksPadded[i] = speechTokens[i].toInt()
         val speechToksTensor = Tensor.fromBlob(
             speechToksPadded,
             longArrayOf(1, Constants.MAX_SPEECH_TOKENS_VOCODER.toLong())
         )
         val speechTokLenTensor = Tensor.fromBlob(
-            longArrayOf(nTokens.toLong()),
+            intArrayOf(copyLen),
             longArrayOf(1)
         )
 
@@ -330,12 +331,13 @@ class VocoderPipeline(
         return Tensor.fromBlob(floats, shape)
     }
 
-    private fun loadLongAsset(name: String, shape: LongArray): Tensor {
+    private fun loadIntAsset(name: String, shape: LongArray): Tensor {
         val bytes = context.assets.open(name).readBytes()
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        val longs = LongArray(bytes.size / 8)
-        buffer.asLongBuffer().get(longs)
-        return Tensor.fromBlob(longs, shape)
+        val ints = IntArray(bytes.size / 4)
+        buffer.asIntBuffer().get(ints)
+        require(ints.size.toLong() == shape.fold(1L) { a, b -> a * b }) { "Invalid asset size: $name" }
+        return Tensor.fromBlob(ints, shape)
     }
 }
 
