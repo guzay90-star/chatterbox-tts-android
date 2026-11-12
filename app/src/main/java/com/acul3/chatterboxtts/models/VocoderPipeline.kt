@@ -67,6 +67,7 @@ class VocoderPipeline(
         speechTokens: LongArray,
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): FloatArray {
+        try {
         Log.i(TAG, "Starting vocoder pipeline with ${speechTokens.size} speech tokens")
 
         val nTokens = speechTokens.size
@@ -88,6 +89,7 @@ class VocoderPipeline(
             longArrayOf(1)
         )
 
+        s3genEncoder.load()
         val encOutputs = s3genEncoder.forward(
             EValue.from(speechToksTensor),
             EValue.from(speechTokLenTensor),
@@ -106,6 +108,7 @@ class VocoderPipeline(
         val T_mel_actual = hShape[1].toInt()
         val hLenVal = hLenTensor.dataAsLongArray[0].toInt()
         val melLen1Val = melLen1Tensor.dataAsLongArray[0].toInt()
+        s3genEncoder.close()
 
         Log.i(TAG, "S3Gen encoder: h=${hShape.contentToString()}, h_len=$hLenVal, mel_len1=$melLen1Val")
         onProgress(0.15f, "S3Gen encoder done. Building CFM inputs...")
@@ -154,6 +157,7 @@ class VocoderPipeline(
         // ── Step 3: CFM loop × 2 (with CFG) ─────────────────────────────────
         onProgress(0.2f, "Running CFM step 1/${CFM_STEPS}...")
 
+        cfmStep.load()
         for (stepI in 0 until CFM_STEPS) {
             val tVal = tSpan[stepI]
             val rVal = tSpan[stepI + 1]
@@ -224,6 +228,8 @@ class VocoderPipeline(
                 "CFM step ${stepI + 1}/$CFM_STEPS done")
         }
 
+        cfmStep.close()
+
         // Extract speech mel: remove prompt portion, trim to actual length
         // mel_out = z[:, :, mel_len1_val:h_len_val]
         val melOutLen = hLenVal - melLen1Val
@@ -245,6 +251,7 @@ class VocoderPipeline(
         val nChunks = (T_mel_speech + HIFI_T_MEL - 1) / HIFI_T_MEL
         val wavChunks = mutableListOf<FloatArray>()
 
+        hifigan.load()
         for (chunkI in 0 until nChunks) {
             val start = chunkI * HIFI_T_MEL
             val end = min(start + HIFI_T_MEL, T_mel_speech)
@@ -283,6 +290,7 @@ class VocoderPipeline(
                 "HiFiGAN chunk ${chunkI + 1}/$nChunks")
         }
 
+        hifigan.close()
         val totalSamples = wavChunks.sumOf { it.size }
         val audioOut = FloatArray(totalSamples)
         var offset = 0
@@ -296,6 +304,11 @@ class VocoderPipeline(
         onProgress(1f, "Vocoder complete: ${String.format("%.1f", durationSec)}s")
 
         return audioOut
+        } finally {
+            s3genEncoder.close()
+            cfmStep.close()
+            hifigan.close()
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

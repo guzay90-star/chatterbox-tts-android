@@ -64,27 +64,17 @@ class ChatterboxTTS(private val context: Context) {
         onProgress(0f, "Loading tokenizer...")
         tokenizer = TextTokenizer(context)
 
-        // Load conditioning models
-        onProgress(0.1f, "Loading cond speech emb model...")
-        condSpeechEmbModel = PteModel(modelManager.getModelPath("t3_cond_speech_emb.pte")).also { it.load() }
-
-        onProgress(0.2f, "Loading cond enc model...")
-        condEncModel = PteModel(modelManager.getModelPath("t3_cond_enc.pte")).also { it.load() }
-
-        // Load T3 models
-        onProgress(0.3f, "Loading T3 prefill...")
-        val prefill = PteModel(modelManager.getModelPath("t3_prefill.pte")).also { it.load() }
-        onProgress(0.5f, "Loading T3 decode...")
-        val decode = PteModel(modelManager.getModelPath("t3_decode.pte")).also { it.load() }
-        t3Decoder = T3Decoder(prefill, decode)
-
-        // Load vocoder models
-        onProgress(0.6f, "Loading S3Gen encoder...")
-        val s3gen = PteModel(modelManager.getModelPath("s3gen_encoder.pte")).also { it.load() }
-        onProgress(0.7f, "Loading CFM step...")
-        val cfm = PteModel(modelManager.getModelPath("cfm_step.pte")).also { it.load() }
-        onProgress(0.8f, "Loading HiFiGAN...")
-        val hifigan = PteModel(modelManager.getModelPath("hifigan.pte")).also { it.load() }
+        // Keep model descriptors, but do NOT load all seven models together.
+        // Prefill and decoder can consume several gigabytes of memory.
+        onProgress(0.1f, "Preparing models for lazy loading...")
+        condSpeechEmbModel = PteModel(modelManager.getModelPath("t3_cond_speech_emb.pte"))
+        condEncModel = PteModel(modelManager.getModelPath("t3_cond_enc.pte"))
+        val prefill = PteModel(modelManager.getModelPath("t3_prefill.pte"))
+        val decode = PteModel(modelManager.getModelPath("t3_decode.pte"))
+        t3Decoder = T3Decoder(context, prefill, decode)
+        val s3gen = PteModel(modelManager.getModelPath("s3gen_encoder.pte"))
+        val cfm = PteModel(modelManager.getModelPath("cfm_step.pte"))
+        val hifigan = PteModel(modelManager.getModelPath("hifigan.pte"))
         vocoderPipeline = VocoderPipeline(context, s3gen, cfm, hifigan)
 
         // Load default voice conditioning from assets
@@ -193,18 +183,26 @@ class ChatterboxTTS(private val context: Context) {
 
         // Step a: embed cond speech tokens (1, 150) → (1, 150, 1024)
         Log.i(TAG, "Running t3_cond_speech_emb...")
-        val speechEmbOutputs = condSpeechEmbModel!!.forward(EValue.from(cst))
-        val condSpeechEmb = speechEmbOutputs[0].toTensor()
+        val condSpeechEmb = try {
+            condSpeechEmbModel!!.load()
+            val tensor = condSpeechEmbModel!!.forward(EValue.from(cst))[0].toTensor()
+            Tensor.fromBlob(tensor.dataAsFloatArray, tensor.shape())
+        } finally {
+            condSpeechEmbModel?.close()
+        }
         Log.i(TAG, "cond_speech_emb shape: ${condSpeechEmb.shape().contentToString()}")
 
         // Step b: encode conditioning (speaker_emb, cond_speech_emb, emotion_adv) → (1, 34, 1024)
         Log.i(TAG, "Running t3_cond_enc...")
-        val condEncOutputs = condEncModel!!.forward(
-            EValue.from(spk),
-            EValue.from(condSpeechEmb),
-            EValue.from(emo)
-        )
-        cachedCondEmb = condEncOutputs[0].toTensor()
+        try {
+            condEncModel!!.load()
+            val encoded = condEncModel!!.forward(
+                EValue.from(spk), EValue.from(condSpeechEmb), EValue.from(emo)
+            )[0].toTensor()
+            cachedCondEmb = Tensor.fromBlob(encoded.dataAsFloatArray, encoded.shape())
+        } finally {
+            condEncModel?.close()
+        }
         Log.i(TAG, "cond_emb shape: ${cachedCondEmb!!.shape().contentToString()}")
     }
 

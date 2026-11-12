@@ -1,165 +1,141 @@
 package com.acul3.chatterboxtts.models
 
+import android.content.Context
 import android.util.Log
 import com.acul3.chatterboxtts.tts.Constants
 import com.acul3.chatterboxtts.tts.SpeechSampler
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Tensor
+import org.pytorch.executorch.TensorBufferAccess
+import java.nio.FloatBuffer
 
 /**
- * T3 prefill + autoregressive decode loop.
- * Produces speech tokens from text + conditioning embeddings.
- *
- * Model interfaces (V4):
- *   t3_prefill.pte:
- *     inputs:  cond_emb (1,34,1024) float, text_tokens (1,258) int32
- *     outputs: logits (1,8194) float, kv_flat (79441920,) float
- *              kv_flat shape = (30, 2, 1, 16, 1293, 64) — split dim1 → keys/values
- *
- *   t3_decode.pte (V4):
- *     inputs:  prev_token (1,1) int32, step_idx () int32 scalar,
- *              kv_k (30,1,16,1293,64) float, kv_v (30,1,16,1293,64) float
- *     outputs: logits (1,8194) float,
- *              kv_k (30,1,16,1293,64) float, kv_v (30,1,16,1293,64) float
+ * RAM-efficient T3 prefill / decode for ExecuTorch 1.1.0.
+ * The prefill tensor contains ~318 MB of interleaved K/V state.
+ * It must never be converted to FloatArray on Android's capped Java heap.
+ * Decode K/V outputs are copied into SharedMemory / mmap rather than retained
+ * in Java-owned direct ByteBuffers, which also consume Android heap quota.
  */
 class T3Decoder(
+    private val context: Context,
     private val prefillModel: PteModel,
     private val decodeModel: PteModel
 ) {
-
     companion object {
         private const val TAG = "T3Decoder"
-        // KV flat size from prefill: 30 * 2 * 1 * 16 * 1293 * 64 = 79441920
-        // Each layer stores its key block followed by its value block.
-        private const val KV_HALF = 30 * 1 * 16 * 1293 * 64  // 39720960
+        private const val KV_HALF = 30 * 1 * 16 * 1293 * 64
+        private const val KV_TOTAL = KV_HALF * 2
         private val KV_SHAPE = longArrayOf(30, 1, 16, 1293, 64)
     }
 
-    /**
-     * Run the full T3 decode pipeline.
-     *
-     * @param condEmbedding Conditioning embedding tensor (1, 34, 1024)
-     * @param textTokens Text token IDs (1, 258) int32
-     * @param onProgress Callback with (progress 0-1, message)
-     * @return Array of speech token IDs
-     */
+    private data class PrefillState(val logits: Tensor, val memory: KvMappedMemory)
+
     fun decode(
         condEmbedding: Tensor,
         textTokens: Tensor,
         maxSteps: Int = Constants.MAX_DECODE_STEPS,
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): LongArray {
-        Log.i(TAG, "Starting T3 prefill...")
-        onProgress(0f, "Running T3 prefill...")
-
-        val initial = runPrefill(condEmbedding, textTokens)
-        var currentLogits = initial.first
-        var kvK = initial.second
-        var kvV = initial.third
-
-        Log.i(TAG, "Prefill done, starting decode loop...")
-        onProgress(0.05f, "Prefill complete. Decoding speech tokens...")
-
-        if (!decodeModel.isLoaded()) decodeModel.load()
-        try {
-        // Autoregressive decode
-        val speechTokens = mutableListOf<Long>()
         require(maxSteps in 1..Constants.MAX_DECODE_STEPS)
-
-        // First token is sampled from prefill logits
-        for (step in 0 until maxSteps) {
-            val logitsData = currentLogits.dataAsFloatArray
-
-            // Take logits for the last position (shape is (1, SPEECH_VOCAB) already)
-            val vocabLogits = if (logitsData.size > Constants.SPEECH_VOCAB) {
-                logitsData.copyOfRange(logitsData.size - Constants.SPEECH_VOCAB, logitsData.size)
-            } else {
-                logitsData
+        Log.i(TAG, "Starting prefill with mapped KV cache")
+        onProgress(0f, "Running T3 prefill...")
+        val initial = runPrefill(condEmbedding, textTokens)
+        try {
+            var logits = initial.logits
+            val memory = initial.memory
+            val keys = memory.keysTensor(KV_SHAPE)
+            val values = memory.valuesTensor(KV_SHAPE)
+            val result = ArrayList<Long>(maxSteps)
+            // Load the decode model only after unloading prefill.
+            decodeModel.load()
+            try {
+                onProgress(0.05f, "Prefill complete. Decoding speech tokens...")
+                for (step in 0 until maxSteps) {
+                    val data = logits.dataAsFloatArray // only 8,194 floats, never the KV tensor
+                    val vocabLogits = if (data.size > Constants.SPEECH_VOCAB) {
+                        data.copyOfRange(data.size - Constants.SPEECH_VOCAB, data.size)
+                    } else data
+                    val token = SpeechSampler.sampleToken(
+                        logits = vocabLogits,
+                        previousTokens = result.map { it.toInt() }
+                    ).toLong()
+                    if (token == Constants.EOT_SPEECH.toLong()) {
+                        Log.i(TAG, "EOS at step $step")
+                        break
+                    }
+                    result.add(token)
+                    if (step % 25 == 0) {
+                        val progress = 0.05f + 0.95f * step.toFloat() / maxSteps
+                        onProgress(progress, "Decode step $step: ${result.size} tokens")
+                    }
+                    if (step + 1 == maxSteps) break
+                    // Calling a separate method lets large decode output buffers become
+                    // unreachable BEFORE the next iteration allocates new JNI outputs.
+                    logits = decodeOne(token.toInt(), step, keys, values, memory)
+                }
+                onProgress(1f, "Generated ${result.size} speech tokens")
+                return result.toLongArray()
+            } finally {
+                decodeModel.close()
             }
-
-            val token = SpeechSampler.sampleToken(
-                logits = vocabLogits,
-                previousTokens = speechTokens.map { it.toInt() }
-            ).toLong()
-
-            // Check for EOS
-            if (token == Constants.EOT_SPEECH.toLong()) {
-                Log.i(TAG, "EOS token at step $step")
-                break
-            }
-
-            speechTokens.add(token)
-
-            // Progress update
-            val progress = 0.05f + (step.toFloat() / maxSteps) * 0.95f
-            if (step % 50 == 0) {
-                onProgress(progress, "Decode step $step: ${speechTokens.size} tokens generated")
-            }
-
-            if (step + 1 == maxSteps) break
-
-            // Prepare decode inputs
-            // prev_token: (1, 1) int32
-            val tokenTensor = Tensor.fromBlob(
-                intArrayOf(token.toInt()),
-                longArrayOf(1, 1)
-            )
-            // step_idx: () int32 scalar (0-indexed, step=0 is first generated token)
-            val stepTensor = Tensor.fromBlob(
-                intArrayOf(step),
-                longArrayOf()  // scalar = empty shape
-            )
-
-            // Run decode step V4
-            val decodeOutputs = decodeModel.forward(
-                EValue.from(tokenTensor),
-                EValue.from(stepTensor),
-                EValue.from(kvK),
-                EValue.from(kvV)
-            )
-
-            currentLogits = decodeOutputs[0].toTensor()
-            kvK = decodeOutputs[1].toTensor()
-            kvV = decodeOutputs[2].toTensor()
-        }
-
-        Log.i(TAG, "Decode complete: ${speechTokens.size} speech tokens")
-        onProgress(1f, "Generated ${speechTokens.size} speech tokens")
-
-        return speechTokens.toLongArray()
         } finally {
-            decodeModel.close()
+            initial.memory.close()
         }
     }
-    private fun runPrefill(cond: Tensor, text: Tensor): Triple<Tensor, Tensor, Tensor> {
-        if (!prefillModel.isLoaded()) prefillModel.load()
+
+    private fun runPrefill(cond: Tensor, text: Tensor): PrefillState {
+        var memory: KvMappedMemory? = null
         try {
+            prefillModel.load()
             val outputs = prefillModel.forward(EValue.from(cond), EValue.from(text))
-            val logits = outputs[0].toTensor()
-            // Own the output before releasing the multi-gigabyte prefill module.
-            val ownedLogits = Tensor.fromBlob(logits.dataAsFloatArray, logits.shape())
-            val (keys, values) = splitKvCache(outputs[1].toTensor())
-            return Triple(ownedLogits, keys, values)
+            check(outputs.size >= 2) { "T3 prefill returned only ${outputs.size} values" }
+            val rawLogits = outputs[0].toTensor()
+            val ownedLogits = Tensor.fromBlob(rawLogits.dataAsFloatArray, rawLogits.shape())
+            val flat = outputs[1].toTensor()
+            check(flat.numel() == KV_TOTAL.toLong()) { "Unexpected KV size: ${flat.numel()}" }
+            val source = TensorBufferAccess.floatBuffer(flat)
+            memory = KvMappedMemory(context, KV_HALF)
+            val layerSize = KV_HALF / Constants.N_LAYERS
+            // Prefill layout: [layer, 2 (K/V), batch, heads, time, headDim].
+            // Decoder layout: K layers followed by V layers.
+            for (layer in 0 until Constants.N_LAYERS) {
+                val sourceStart = layer * layerSize * 2
+                val targetStart = layer * layerSize
+                memory.copyLayerFrom(source, sourceStart, memory.keys, targetStart, layerSize)
+                memory.copyLayerFrom(source, sourceStart + layerSize, memory.values, targetStart, layerSize)
+            }
+            Log.i(TAG, "Prefill complete; KV mapped outside Java heap")
+            return PrefillState(ownedLogits, memory)
+        } catch (t: Throwable) {
+            memory?.close()
+            throw t
         } finally {
             prefillModel.close()
         }
     }
 
-    /** The export flattens [layer, key/value, batch, head, time, dim]. */
-    private fun splitKvCache(flat: Tensor): Pair<Tensor, Tensor> {
-        val data = flat.dataAsFloatArray
-        require(data.size == KV_HALF * 2) { "Unexpected KV cache size: ${data.size}" }
-        val layerSize = KV_HALF / Constants.N_LAYERS
-        // Direct buffers avoid two additional 159 MB Java heap arrays.
-        val keys = Tensor.allocateFloatBuffer(KV_HALF)
-        val values = Tensor.allocateFloatBuffer(KV_HALF)
-        for (layer in 0 until Constants.N_LAYERS) {
-            keys.put(data, layer * 2 * layerSize, layerSize)
-            values.put(data, (layer * 2 + 1) * layerSize, layerSize)
-        }
-        keys.rewind()
-        values.rewind()
-        return Tensor.fromBlob(keys, KV_SHAPE) to Tensor.fromBlob(values, KV_SHAPE)
+    private fun decodeOne(
+        token: Int,
+        step: Int,
+        keys: Tensor,
+        values: Tensor,
+        memory: KvMappedMemory
+    ): Tensor {
+        val tokenTensor = Tensor.fromBlob(intArrayOf(token), longArrayOf(1, 1))
+        val stepTensor = Tensor.fromBlob(intArrayOf(step), longArrayOf())
+        val outputs = decodeModel.forward(
+            EValue.from(tokenTensor), EValue.from(stepTensor),
+            EValue.from(keys), EValue.from(values)
+        )
+        check(outputs.size >= 3) { "T3 decode returned only ${outputs.size} values" }
+        // Copy small logits, and bulk-copy the 2 x 159 MB K/V outputs into mapped
+        // memory without any large FloatArray or Java-owned KV buffer.
+        val outputLogits = outputs[0].toTensor()
+        val ownedLogits = Tensor.fromBlob(outputLogits.dataAsFloatArray, outputLogits.shape())
+        val outK: FloatBuffer = TensorBufferAccess.floatBuffer(outputs[1].toTensor())
+        val outV: FloatBuffer = TensorBufferAccess.floatBuffer(outputs[2].toTensor())
+        memory.copyAllFrom(outK, memory.keys)
+        memory.copyAllFrom(outV, memory.values)
+        return ownedLogits
     }
-
 }

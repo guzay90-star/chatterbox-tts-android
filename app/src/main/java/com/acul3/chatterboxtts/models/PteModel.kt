@@ -30,7 +30,12 @@ class PteModel(private val modelPath: String) {
      */
     fun forward(vararg inputs: EValue): Array<EValue> {
         val mod = module ?: throw IllegalStateException("Model not loaded: $modelPath")
-        return mod.forward(*inputs)
+        return try {
+            mod.forward(*inputs)
+        } catch (t: Throwable) {
+            Log.e(TAG, "ExecuTorch model failed: $modelPath", t)
+            throw t
+        }
     }
 
     /**

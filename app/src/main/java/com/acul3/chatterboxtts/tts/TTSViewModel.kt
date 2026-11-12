@@ -125,7 +125,7 @@ class TTSViewModel : ViewModel() {
                     )
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e("TTSViewModel", "Generation failed", e)
             _state.update {
                 it.copy(
