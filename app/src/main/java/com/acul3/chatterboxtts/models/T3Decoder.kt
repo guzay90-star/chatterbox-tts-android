@@ -52,22 +52,16 @@ class T3Decoder(
         Log.i(TAG, "Starting T3 prefill...")
         onProgress(0f, "Running T3 prefill...")
 
-        // Prefill: get initial logits and flat KV cache
-        val prefillOutputs = prefillModel.forward(
-            EValue.from(condEmbedding),
-            EValue.from(textTokens)
-        )
-
-        var currentLogits = prefillOutputs[0].toTensor()
-        val kvFlat = prefillOutputs[1].toTensor()
-
-        val (initialK, initialV) = splitKvCache(kvFlat)
-        var kvK = initialK
-        var kvV = initialV
+        val initial = runPrefill(condEmbedding, textTokens)
+        var currentLogits = initial.first
+        var kvK = initial.second
+        var kvV = initial.third
 
         Log.i(TAG, "Prefill done, starting decode loop...")
         onProgress(0.05f, "Prefill complete. Decoding speech tokens...")
 
+        if (!decodeModel.isLoaded()) decodeModel.load()
+        try {
         // Autoregressive decode
         val speechTokens = mutableListOf<Long>()
         require(maxSteps in 1..Constants.MAX_DECODE_STEPS)
@@ -133,7 +127,24 @@ class T3Decoder(
         onProgress(1f, "Generated ${speechTokens.size} speech tokens")
 
         return speechTokens.toLongArray()
+        } finally {
+            decodeModel.close()
+        }
     }
+    private fun runPrefill(cond: Tensor, text: Tensor): Triple<Tensor, Tensor, Tensor> {
+        if (!prefillModel.isLoaded()) prefillModel.load()
+        try {
+            val outputs = prefillModel.forward(EValue.from(cond), EValue.from(text))
+            val logits = outputs[0].toTensor()
+            // Own the output before releasing the multi-gigabyte prefill module.
+            val ownedLogits = Tensor.fromBlob(logits.dataAsFloatArray, logits.shape())
+            val (keys, values) = splitKvCache(outputs[1].toTensor())
+            return Triple(ownedLogits, keys, values)
+        } finally {
+            prefillModel.close()
+        }
+    }
+
     /** The export flattens [layer, key/value, batch, head, time, dim]. */
     private fun splitKvCache(flat: Tensor): Pair<Tensor, Tensor> {
         val data = flat.dataAsFloatArray
