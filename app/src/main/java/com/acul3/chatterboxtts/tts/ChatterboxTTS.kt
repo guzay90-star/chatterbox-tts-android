@@ -122,7 +122,7 @@ class ChatterboxTTS(private val context: Context) {
 
         // Step 1: Tokenize text
         onProgress(0f, "Tokenizing text...")
-        val rawTokenIds = tok.encode(text, language)
+        val rawTokenIds = tok.encode(text, language).drop(1).dropLast(1)
         Log.i(TAG, "Tokenized: ${rawTokenIds.size} raw tokens")
 
         // Pad/truncate to exactly 256 positions, then wrap with SOT=255 and EOT=0
